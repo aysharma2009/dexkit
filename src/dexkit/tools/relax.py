@@ -37,6 +37,10 @@ def _key_reader():
     """Returns a poll(timeout) -> bytes|None over the terminal in cbreak mode, and a restore()."""
     if not sys.stdin.isatty():
         return (lambda _t: None), (lambda: None)
+    if os.name == "nt":
+        from dexkit.util import windows_read_key
+
+        return windows_read_key, (lambda: None)
     import termios
     import tty
 
@@ -91,9 +95,11 @@ def unwind(hand: FeetechHand, only: list[str] | None, rate_hz: float = 20.0) -> 
     try:
         t_next = time.monotonic()
         while True:
+            if hasattr(hand, "service_safety"):
+                hand.service_safety()
             key = poll(0.0)
             if key == b" ":
-                hand.estop.trip("operator pressed SPACE") if hasattr(hand, "estop") else hand.relax()
+                hand.estop.trip("operator pressed SPACE") if hand.estop is not None else hand.relax()
                 raise EStopTripped("operator pressed SPACE during reverse assist")
             if key and key.isdigit() and 1 <= int(key) <= len(chosen):
                 s = chosen[int(key) - 1]
@@ -141,6 +147,25 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
     args.yes = True  # the "make it safe" command never waits for 'go'
     init(args)
+    if args.now:
+        # A torque-off command must not connect a calibrated, torque-enabling session.
+        from dexkit.config import load_hand_config
+        from dexkit.hw.feetech_hand import open_serial
+        from dexkit.tools.estop import stop_hand
+
+        cfg = load_hand_config()
+        if args.mock:
+            from dexkit.hw.mock import MockFeetechSerial, mock_servos_for
+
+            transport = MockFeetechSerial(mock_servos_for(cfg), baudrate=cfg.baud)
+        else:
+            transport = open_serial(cfg.port, cfg.baud, cfg.timeout_s)
+        try:
+            stop_hand(transport, cfg.ids, cfg.register_map()["torque_enable"])
+        finally:
+            transport.close()
+        print("hand torque off")
+        return
     try:
         with open_session(args, need_hand=True) as s:
             assert s.hand is not None and s.hand_cfg is not None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -32,6 +33,12 @@ def config_dir(override: str | os.PathLike | None = None) -> Path:
 def data_dir() -> Path:
     env = os.environ.get("DEXKIT_DATA")
     return Path(env) if env else REPO_ROOT / "data"
+
+
+def isolate_mock_data(mock: bool) -> None:
+    """A simulated session must not overwrite physical position memory or stop flags."""
+    if mock and "DEXKIT_DATA" not in os.environ:
+        os.environ["DEXKIT_DATA"] = str(REPO_ROOT / "data" / "mock-runtime")
 
 
 def load_yaml(path: str | os.PathLike) -> dict[str, Any]:
@@ -112,8 +119,16 @@ class ServoConfig:
     stall_load: int = 800
     calibrated: bool = False  # set by dexkit-calibrate-hand when slack/tight were measured
     enabled: bool = True  # false: torque stays OFF and the servo is never commanded (free-wheels)
+    release_ticks: int | None = None  # independently measured pay-out beyond this tendon's slack
+    goal_torque: int | None = None  # per-tendon cap, bounded by defaults.goal_torque
 
     def __post_init__(self) -> None:
+        if self.release_ticks is not None and not 0 <= self.release_ticks <= MAX_TICKS:
+            raise ConfigError("release_ticks must be within 0..32767")
+        if self.goal_torque is not None and not 0 <= self.goal_torque <= 1000:
+            raise ConfigError("per-servo goal_torque must be within 0..1000")
+        if self.max_delta_ticks <= 0 or self.slack == self.tight:
+            raise ConfigError("servo needs positive max_delta_ticks and a nonzero calibrated span")
         if self.name in TENDONS:
             self.finger, self.role = TENDONS[self.name]
         if self.role and self.role not in ROLES:
@@ -176,18 +191,35 @@ class HandDefaults:
     calib_step_ticks: int = 40
     calib_max_travel_ticks: int = 3 * TICKS_PER_REV  # give up finding 'tight' after this much travel
     calib_direction: int = 1  # +1: step toward higher counts, -1: lower; --reverse flips it
-    calib_direction: int = 1  # +1: step toward higher counts, -1: lower (the bench hand winds on -1)
     stall_load_factor: float = 1.5
     stall_load_floor: int = 650  # above goal_torque (600): the torque cap protects the tendons; the stall
     # watch only trips if goal_torque is raised past it. Lower this to re-enable load back-off.
     stall_time_s: float = 0.5
     stall_backoff: float = 0.05
     antagonist_max_sum: float = 1.0  # flexor + extensor of one finger may never exceed this together
-    # When one side of a pair winds, the other side must unwind (pay out) the same length of
-    # tendon or it brakes the finger. Ratio of the puller's travel to pay out, and a cap in
-    # ticks so a long take-up span (pinky_flex is 2 turns) can never dump a tendon off its spool.
-    antagonist_payout: float = 1.0
+    # Legacy cross-servo pay-out ratio is opt-in: equal rotations do not imply equal
+    # cable movement. Prefer the released servo's independently measured release_ticks.
+    antagonist_payout: float = 0.0  # legacy ratio; prefer independently measured release_ticks per servo
     antagonist_payout_max_ticks: int = 1000
+    antagonist_release_first: bool = True
+    antagonist_release_tolerance: float = 0.05
+    antagonist_release_timeout_s: float = 30.0
+    feedback_period_s: float = 0.1
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.feedback_period_s) or not 0 < self.feedback_period_s <= 1:
+            raise ConfigError("feedback_period_s must be finite and within (0, 1]")
+        if not 0 <= self.antagonist_release_tolerance < 1:
+            raise ConfigError("antagonist_release_tolerance must be within [0, 1)")
+        if not math.isfinite(self.antagonist_release_timeout_s) or self.antagonist_release_timeout_s <= 0:
+            raise ConfigError("antagonist_release_timeout_s must be finite and positive")
+        if not 0 <= self.antagonist_payout or not 0 <= self.antagonist_payout_max_ticks <= MAX_TICKS:
+            raise ConfigError("invalid antagonist pay-out limits")
+        if not 1 <= self.speed <= 32767 or not 0 <= self.accel <= 254:
+            raise ConfigError("invalid servo speed or acceleration")
+        for torque in (self.goal_torque, self.torque_limit, self.calib_torque_limit, self.tune_torque):
+            if not 0 <= torque <= 1000:
+                raise ConfigError("torque settings must be within 0..1000")
 
 
 @dataclass
@@ -212,6 +244,10 @@ class HandConfig:
     def __post_init__(self) -> None:
         if len(self.servos) != 12:
             raise ConfigError(f"hand.yaml: expected 12 finger servos, got {len(self.servos)}")
+        if not math.isfinite(self.rate_hz) or self.rate_hz <= 0:
+            raise ConfigError("hand rate_hz must be finite and positive")
+        if not math.isfinite(self.voltage_check_period_s) or self.voltage_check_period_s <= 0:
+            raise ConfigError("voltage_check_period_s must be finite and positive")
         ids = [s.id for s in self.servos] + [self.roll.id]
         if len(set(ids)) != len(ids):
             raise ConfigError(f"hand.yaml: servo IDs must be unique, got {ids}")
@@ -279,6 +315,11 @@ class HandConfig:
         regs.update(FAMILY_REGISTERS[self.servo_family])
         regs.update(self.registers or {})
         return regs
+
+    def torque_for(self, sid: int) -> int:
+        servo = next((s for s in self.servos if s.id == sid), None)
+        requested = servo.goal_torque if servo is not None else None
+        return min(self.defaults.goal_torque, requested if requested is not None else self.defaults.goal_torque)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

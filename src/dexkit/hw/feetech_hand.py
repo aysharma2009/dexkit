@@ -66,6 +66,8 @@ def save_positions_state(entries: dict[int, dict[str, int]], roll_center: int | 
     servos = state.setdefault("servos", {})
     for sid, e in entries.items():
         servos[str(sid)] = {"pos": int(e["pos"]), "slack": int(e["slack"])}
+        if "calibration" in e:
+            servos[str(sid)]["calibration"] = e["calibration"]
     if roll_center is not None:
         state["roll_center"] = int(roll_center)
     state["saved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -174,7 +176,9 @@ class FeetechDriver:
         return self.bus.write(sid, self.reg["goal_torque"], le16(int(torque)))
 
     def write_position(self, sid: int, ticks: int) -> bool:
-        return self.bus.write(sid, self.reg["goal_position"], encode_position(int(ticks)))
+        if not self.bus.write(sid, self.reg["goal_position"], encode_position(int(ticks))):
+            raise SafetyTrip(f"servo {sid}: position write not acknowledged")
+        return True
 
     def sync_write_positions(self, targets: dict[int, int]) -> None:
         """The hot path: one 0x83 packet for all servos."""
@@ -224,6 +228,9 @@ class FeetechHand(HandInterface):
         self._load_cap = np.ones(N_FINGERS)
         self._last_voltage_check = 0.0
         self._last_state: HandState | None = None
+        self._last_feedback = 0.0
+        self._release_since = {}
+        self.estop = None  # assigned by Session before connect
         self.torque_on = False
         self.connected = False
         self.last_loop_ms = 0.0
@@ -233,7 +240,9 @@ class FeetechHand(HandInterface):
 
     def _payout_ticks(self, i: int, other: int) -> float:
         """How far servo i may unwind past slack while its antagonist `other` is fully pulled."""
-        return min(self._payout * abs(self._span[other]), float(self._payout_cap))
+        measured = self.cfg.servos[i].release_ticks
+        return min(float(measured) if measured is not None else self._payout * abs(self._span[other]),
+                   float(self._payout_cap))
 
     def _set_slack(self, slack: np.ndarray, roll: RollConfig) -> None:
         self._slack = np.asarray(slack, dtype=float)
@@ -313,6 +322,8 @@ class FeetechHand(HandInterface):
         for i, s in enumerate(self.cfg.servos):
             now = present[s.id]
             e = saved.get(str(s.id))
+            if e and "calibration" in e and e["calibration"] != [s.slack, s.tight, s.inverted]:
+                e = None  # a new calibration supersedes the old live coordinate frame
             if e is None:
                 # No memory yet: hand.yaml is absolute in the count frame it was calibrated in.
                 # Put it on the turn nearest the present reading.
@@ -323,7 +334,7 @@ class FeetechHand(HandInterface):
             k = round((e["pos"] - now) / TICKS_PER_REV)
             drift = abs(e["pos"] - k * TICKS_PER_REV - now)
             if drift <= RESTORE_DRIFT_TICKS:
-                slack[i] = s.slack - k * TICKS_PER_REV  # hand.yaml's open, on the right turn
+                slack[i] = e.get("slack", s.slack) - k * TICKS_PER_REV
                 restored.append(s.name)
                 drifts.append(drift)
             else:
@@ -337,9 +348,10 @@ class FeetechHand(HandInterface):
 
     def _save_positions(self, present: dict[int, int]) -> None:
         try:
-            save_positions_state({s.id: {"pos": present[s.id], "slack": int(self._slack[i])}
+            save_positions_state({s.id: {"pos": present[s.id], "slack": int(self._slack[i]),
+                                        "calibration": [s.slack, s.tight, s.inverted]}
                                   for i, s in enumerate(self.cfg.servos) if s.id in present},
-                                 roll_center=self.roll.center)  # "slack" kept for inspection only
+                                 roll_center=self.roll.center)
         except OSError as e:
             log.warning("could not save hand positions: %s", e)
 
@@ -347,29 +359,37 @@ class FeetechHand(HandInterface):
         """After the operator has pulled the fingers open with torque off: re-base and hold here."""
         if self.driver is None:
             raise RuntimeError("hand not connected")
+        if self.estop is not None:
+            self.estop.check()
         present = self.driver.read_positions(self.ids)
         if len(present) != len(self.ids):
             raise SafetyTrip(f"could not read positions from {sorted(set(self.ids) - set(present))}")
         self.rebase(present)
+        self.write_open(self.cfg.finger_ids)
         ticks = np.array([present[sid] for sid in self.ids], dtype=np.int64)
         self.driver.sync_write_positions(self._active(ticks))
+        self.voltage_gate.check({sid: v for sid in self.ids
+                                 if (v := self.driver.read_voltage(sid)) is not None}, self.active_ids)
         self.driver.set_torque_all(self.active_ids, True)
         self.torque_on = True
         self._last_ticks = ticks
         self._load_cap = np.ones(N_FINGERS)
         self.load_watch.reset()
+        self._release_since.clear()
+        self._last_state = None
+        self._last_feedback = 0.0
         self._last_cmd = (np.zeros(N_FINGERS), self.roll.ticks_to_deg(int(ticks[N_FINGERS])))
 
     # ---------------------------------------------------------------- conversions
 
     def fingers_to_ticks(self, fingers: np.ndarray) -> np.ndarray:
-        """Tick targets for normalized pulls, with antagonist pay-out: while one side of a
-        pair winds, the other unwinds the same tendon length (capped) so it does not brake."""
+        """Tick targets using each tendon's own pull span and measured release allowance.
+        The legacy cross-servo rotation ratio is only used when explicitly configured."""
         u = np.clip(np.asarray(fingers, dtype=float), 0.0, 1.0)
         t = self._slack + u * self._span
         for a, b in self._pairs:
             for i, other in ((a, b), (b, a)):
-                release = min(self._payout * u[other] * abs(self._span[other]), float(self._payout_cap))
+                release = u[other] * self._payout_ticks(i, other)
                 t[i] -= np.sign(self._span[i]) * release
         return t
 
@@ -410,15 +430,17 @@ class FeetechHand(HandInterface):
         self.temp_watch.check(temps)
         log.info("servo voltages OK: %s", ", ".join(f"{k}:{v:.1f}V" for k, v in voltages.items()))
 
-        wrong_mode = {sid: m for sid in self.ids if (m := d.read_mode(sid)) not in (None, 0)}
+        wrong_mode = {sid: m for sid in self.ids if (m := d.read_mode(sid)) != 0}
         if wrong_mode:
             # Mode 2 on HLS is torque mode: position goals are ignored and goal torque spins the servo.
             raise SafetyTrip(f"servos not in position mode (reg 33 must be 0): {wrong_mode}")
         for sid in self.ids:
-            d.set_accel(sid, self.cfg.defaults.accel)
-            d.set_speed(sid, self.cfg.defaults.speed)
-            d.set_torque_limit(sid, self.cfg.defaults.torque_limit)
-            d.set_goal_torque(sid, self.cfg.defaults.goal_torque)
+            for ok in (d.set_accel(sid, self.cfg.defaults.accel),
+                       d.set_speed(sid, self.cfg.defaults.speed),
+                       d.set_torque_limit(sid, self.cfg.defaults.torque_limit),
+                       d.set_goal_torque(sid, self.cfg.torque_for(sid))):
+                if not ok:
+                    raise SafetyTrip(f"servo {sid}: configuration write failed; torque not enabled")
 
         present = d.read_positions(self.ids)
         if len(present) != len(self.ids):
@@ -427,6 +449,8 @@ class FeetechHand(HandInterface):
         ticks = np.array([present[sid] for sid in self.ids], dtype=np.int64)
         # Hold the current position so enabling torque never jumps to a stale goal.
         d.sync_write_positions(self._active(ticks))
+        if self.estop is not None:
+            self.estop.check()
         d.set_torque_all(self.active_ids, True)
         disabled = [sid for sid in self.ids if sid not in self.active_ids]
         if disabled:
@@ -438,6 +462,7 @@ class FeetechHand(HandInterface):
                           self.roll.ticks_to_deg(int(ticks[N_FINGERS])))
         self._last_voltage_check = time.monotonic()
         self.connected = True
+        self._last_feedback = 0.0
         log.info("hand connected: %d servos, torque on", len(self.ids))
 
     # ---------------------------------------------------------------- commands
@@ -447,6 +472,8 @@ class FeetechHand(HandInterface):
         return self._last_cmd[0].copy(), self._last_cmd[1]
 
     def set_targets(self, fingers: np.ndarray, roll_deg: float) -> tuple[np.ndarray, float]:
+        if self.estop is not None:
+            self.estop.check()
         if self.driver is None or not self.connected:
             raise RuntimeError("hand not connected")
         if not self.torque_on:
@@ -454,13 +481,45 @@ class FeetechHand(HandInterface):
         f = np.clip(np.asarray(fingers, dtype=float), 0.0, 1.0)
         if f.shape != (N_FINGERS,):
             raise ValueError(f"fingers must have shape ({N_FINGERS},)")
+        if not np.all(np.isfinite(fingers)) or not np.isfinite(roll_deg):
+            self.relax()
+            raise SafetyTrip("non-finite hand target")
+        self.service_safety()
         f = np.where(self._enabled, f, 0.0)  # disabled servos: nothing is ever asked of them
+        pending_releases = []
+        if self.cfg.defaults.antagonist_release_first:
+            self._waiting_for_release = False
+            measured = self._last_state.fingers if self._last_state is not None else self._last_cmd[0]
+            tol = self.cfg.defaults.antagonist_release_tolerance
+            for a, b in self._pairs:
+                blocked = False
+                if f[a] > tol and f[b] > tol:
+                    f[a] = f[b] = 0.0  # conflicting pulls: neutral, never deliberate co-contraction
+                else:
+                    for incoming, outgoing in ((a, b), (b, a)):
+                        release = f[incoming] * self._payout_ticks(outgoing, incoming)
+                        desired = -release / abs(self._span[outgoing])
+                        tolerance = min(tol, 20 / abs(self._span[outgoing]))
+                        if f[incoming] > tol and measured[outgoing] > desired + tolerance:
+                            self._waiting_for_release = True
+                            blocked = True
+                            since = self._release_since.setdefault((a, b), time.monotonic())
+                            if time.monotonic() - since > self.cfg.defaults.antagonist_release_timeout_s:
+                                self.relax()
+                                raise SafetyTrip("opposing tendon failed to release; torque off")
+                            pending_releases.append((outgoing, self._slack[outgoing]
+                                                     - np.sign(self._span[outgoing]) * release))
+                            f[incoming] = f[outgoing] = 0.0
+                if not blocked:
+                    self._release_since.pop((a, b), None)
         f = self.antagonists.apply(f)
         if self.antagonists.limited:
             log.debug("antagonist limit applied")
         f = np.minimum(f, self._load_cap)
         roll = float(np.clip(roll_deg, -self.roll.range_deg, self.roll.range_deg))
         target = np.append(self.fingers_to_ticks(f), self.roll.deg_to_ticks(roll))
+        for outgoing, released_tick in pending_releases:
+            target[outgoing] = released_tick
         prev_ticks = self._last_ticks
         ticks = self.clamp.apply(target, prev_ticks)
         t0 = time.perf_counter()
@@ -484,15 +543,27 @@ class FeetechHand(HandInterface):
         self._load_cap = np.where(np.asarray(fingers) < self._load_cap - 1e-6, 1.0, self._load_cap)
         return sent[0].copy(), sent[1]
 
+    def service_safety(self) -> None:
+        """Bound feedback latency even when callers do not request an observation."""
+        if self.estop is not None:
+            self.estop.check()
+        if self.torque_on and time.monotonic() - self._last_feedback >= self.cfg.defaults.feedback_period_s:
+            try:
+                self.get_state()
+            except Exception:
+                self.relax()
+                raise
+
     def get_state(self) -> HandState:
         if self.driver is None:
             raise RuntimeError("hand not connected")
         t0 = time.perf_counter()
         block = self.driver.read_state_block(self.ids)
         read_ms = (time.perf_counter() - t0) * 1000
-        missing = [sid for sid in self.ids if sid not in block]
-        if missing:
-            log.warning("no state from servos %s", missing)
+        missing_active = sorted(set(self.active_ids) - set(block))
+        if self.torque_on and missing_active:
+            self.relax()
+            raise SafetyTrip(f"no state from active servos {missing_active}")
         now = time.monotonic()
         ticks = {sid: int(v["position"]) for sid, v in block.items()}
         load = {sid: int(v["load"]) for sid, v in block.items()}
@@ -502,7 +573,7 @@ class FeetechHand(HandInterface):
         if self.torque_on and now - self._last_voltage_check >= self.cfg.voltage_check_period_s:
             self._last_voltage_check = now
             try:
-                self.voltage_gate.check(voltage)
+                self.voltage_gate.check(voltage, expected_ids=self.active_ids)
                 self.temp_watch.check(temp)
             except SafetyTrip:
                 self.relax()
@@ -519,7 +590,7 @@ class FeetechHand(HandInterface):
             loads = np.array([load.get(sid, 0) for sid in self.cfg.finger_ids], dtype=float)
             loads[~self._enabled] = 0.0  # free-wheeling servos report drag, not a stall
             for i in self.load_watch.update(loads, now):
-                present_u = float(np.clip(self.ticks_to_fingers(finger_ticks[i : i + 1])[0], 0, 1))
+                present_u = float(np.clip(self.ticks_to_fingers(finger_ticks)[i], 0, 1))
                 self._load_cap[i] = max(0.0, min(self._load_cap[i], present_u) - self.cfg.defaults.stall_backoff)
                 log.warning("servo %s stalled (load %.0f): backing off to %.2f",
                             self.cfg.servos[i].name, loads[i], self._load_cap[i])
@@ -534,7 +605,14 @@ class FeetechHand(HandInterface):
             timestamp=now,
         )
         self._last_state = state
+        self._last_feedback = now
         self.last_read_ms = read_ms
+        if self.torque_on and np.any(self._last_cmd[0] > self._load_cap + 1e-6):
+            # A powered hold/replay wait must physically back off, even without a new
+            # operator command. Advance toward the cap at the normal slew limit.
+            caps = self._load_cap.copy()
+            self.set_targets(*self.last_command)
+            self._load_cap = caps  # an internal correction is not an operator re-arm
         return state
 
     def read_voltages(self) -> dict[int, float]:
@@ -544,6 +622,7 @@ class FeetechHand(HandInterface):
 
     def relax(self) -> None:
         self.torque_on = False
+        self._release_since.clear()
         if self.driver is None:
             return
         try:

@@ -18,9 +18,16 @@ from pathlib import Path
 
 import numpy as np
 
-from dexkit.config import config_dir, data_dir, dump_yaml, gantry_config_from_dict, load_yaml
+from dexkit.config import (
+    config_dir,
+    data_dir,
+    dump_yaml,
+    gantry_config_from_dict,
+    isolate_mock_data,
+    load_yaml,
+)
 from dexkit.control.teleop import JOG_KEYS, KeyEvent, KeySource, ScriptedKeys, TerminalKeys
-from dexkit.hw.safety import TravelBox
+from dexkit.hw.safety import EStop, TravelBox, install_shutdown_handlers
 from dexkit.util import setup_logging
 
 HEADER = """# DexKit gantry configuration (travel box written by dexkit-calibrate-gantry).
@@ -49,6 +56,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--script", help="custom key script 't:key,...'")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args(argv)
+    isolate_mock_data(args.mock)
     setup_logging(args.verbose)
 
     src = config_dir() / "gantry.yaml"
@@ -64,6 +72,10 @@ def main(argv: list[str] | None = None) -> None:
         from dexkit.hw.grbl_gantry import GrblGantry
 
         g = GrblGantry(cfg)
+    estop = EStop()
+    estop.register(gantry=g)
+    g.estop = estop
+    install_shutdown_handlers(None, g)
     g.connect()
     print(f"GRBL {g.version}")
     for k in sorted(g.settings):
@@ -85,6 +97,7 @@ def main(argv: list[str] | None = None) -> None:
     write = False
     try:
         while True:
+            estop.check()
             evs: list[KeyEvent] = keys.poll()
             done = False
             for ev in evs:

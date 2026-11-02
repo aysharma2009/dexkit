@@ -2,15 +2,17 @@ name: ci
 on: [push, pull_request]
 jobs:
   test:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         python-version: ["3.10", "3.12"]
+        os: [ubuntu-22.04, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
-      - run: ruff check src tests
+      - run: ruff check src tests scripts/check_mock.py
       - run: pytest   # no hardware; policy tests skip without torch
+      - run: python scripts/check_mock.py

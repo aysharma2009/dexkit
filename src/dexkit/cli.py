@@ -13,13 +13,14 @@ from dexkit.config import (
     GantryConfig,
     HandConfig,
     config_dir,
+    isolate_mock_data,
     load_gantry_config,
     load_hand_config,
 )
 from dexkit.hw.base import GantryInterface, HandInterface
 from dexkit.hw.ports import PortNotFound
 from dexkit.hw.safety import ESTOP, EStop, SafetyTrip, estop_flag_path, install_shutdown_handlers
-from dexkit.util import setup_logging
+from dexkit.util import guarded_input, setup_logging
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ def add_gantry_flags(p: argparse.ArgumentParser) -> None:
 
 
 def init(args: argparse.Namespace) -> None:
+    isolate_mock_data(getattr(args, "mock", False))
     setup_logging(args.verbose)
     if args.config_dir:
         import os
@@ -111,6 +113,9 @@ def open_session(
                 from dexkit.hw.feetech_hand import FeetechHand
 
                 s.hand = FeetechHand(s.hand_cfg)
+            s.hand.estop = s.estop
+            s.estop.register(hand=s.hand)
+            install_shutdown_handlers(s.hand, None)
             s.hand.connect()
             volts = s.hand.read_voltages()
             port = "MOCK" if mock else getattr(s.hand, "port_name", s.hand_cfg.port)
@@ -126,8 +131,8 @@ def open_session(
             rep = getattr(s.hand, "restore_report", None)
             if rep is not None:
                 if rep["assumed"]:
-                    lines.append(f"[!!] open position unknown for {rep['assumed']}: using where they are NOW. "
-                                 "If any of them is not relaxed/open, type 'home' in dexkit-pose")
+                    lines.append(f"[!!] open reference unconfirmed for {rep['assumed']}. "
+                                 "Check the estimated open position; use 'home' in dexkit-pose to establish it")
                 else:
                     lines.append(f"[ok] open positions restored from the last session "
                                  f"(max drift {rep['max_drift']} ticks)")
@@ -142,6 +147,10 @@ def open_session(
 
                 s.gantry = GrblGantry(s.gantry_cfg)
             try:
+                s.gantry.estop = s.estop
+                s.gantry.safety_service = s.hand.service_safety if s.hand is not None else None
+                s.estop.register(gantry=s.gantry)
+                install_shutdown_handlers(s.hand, s.gantry)
                 s.gantry.connect()
             except PortNotFound as e:
                 if need_gantry:
@@ -158,7 +167,7 @@ def open_session(
                              f"{'valid' if fv else 'NOT zeroed: jog to your reference corner, then zero it'}")
         s.estop.register(hand=s.hand, gantry=s.gantry)
         install_shutdown_handlers(s.hand, s.gantry)
-    except Exception:
+    except BaseException:
         s.close()
         raise
 
@@ -167,7 +176,10 @@ def open_session(
         print("  " + line)
     if not getattr(args, "yes", False):
         try:
-            answer = prompt("Type 'go' to enable motion: ").strip().lower()
+            answer = guarded_input("Type 'go' to begin commands (torque is holding): ", prompt, s.estop, s.hand).strip().lower()
+        except KeyboardInterrupt:
+            s.close()
+            raise
         except EOFError:
             s.close()
             print("\nno keyboard to confirm with (hand relaxed). Run this from a normal terminal window, "
@@ -200,11 +212,8 @@ def establish_frame(s: Session, args: argparse.Namespace, prompt: Prompt) -> Non
     g, cfg = s.gantry, s.gantry_cfg
     assert g is not None and cfg is not None
     if cfg.zeroing == "home":
-        try:
-            g.home()
-            return
-        except Exception as e:  # noqa: BLE001
-            log.error("homing failed: %s", e)
+        g.home()
+        return
     if s.mock:
         log.info("mock gantry: zeroing at the current position")
         g.set_zero()

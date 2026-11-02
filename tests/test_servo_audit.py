@@ -220,9 +220,10 @@ def test_rehome_overrides_restored_open(hand_cfg):
     h = _session(cfg, {cfg.servos[0].id: cfg.servos[0].slack + 300})  # within drift: restored to slack
     assert h._slack[0] == cfg.servos[0].slack
     h.relax()
+    new_open = cfg.servos[0].slack + 300
     h.rehome()  # operator says: where it is now IS open
-    assert h._slack[0] == cfg.servos[0].slack + 300
-    assert load_positions_state()["servos"][str(cfg.servos[0].id)]["slack"] == cfg.servos[0].slack + 300
+    assert h._slack[0] == cfg.servos[0].slack == new_open
+    assert load_positions_state()["servos"][str(cfg.servos[0].id)]["slack"] == new_open
     h.close()
 
 

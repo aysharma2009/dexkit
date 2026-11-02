@@ -457,6 +457,7 @@ class MockGantry(GrblGantry):
                  sim: MockGrblSerial | None = None) -> None:
         self.sim = sim or MockGrblSerial(homing=homing, speed_factor=speed_factor)
         super().__init__(cfg, transport=self.sim)
+        self.persist_frame = False
 
     @property
     def calls(self) -> list[bytes]:

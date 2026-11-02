@@ -36,6 +36,8 @@ class SpaceWatch:
 
     # -- terminal plumbing
     def _enter_cbreak(self) -> None:
+        if os.name == "nt":
+            return
         import termios
         import tty
 
@@ -51,6 +53,10 @@ class SpaceWatch:
         self._fd, self._saved = None, None
 
     def _read_terminal(self, timeout: float) -> bytes | None:
+        if os.name == "nt":
+            from dexkit.util import windows_read_key
+
+            return windows_read_key(timeout)
         assert self._fd is not None
         r, _, _ = select.select([self._fd], [], [], timeout)
         return os.read(self._fd, 1) if r else None

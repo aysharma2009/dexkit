@@ -38,6 +38,10 @@ def hand_cfg():
     for s in cfg.servos:
         s.calibrated = False
     cfg.roll.calibrated = False
+    # Legacy tests explicitly exercise the old paired pay-out/co-contraction behavior.
+    # Release-first and independently calibrated pay-out are covered separately.
+    cfg.defaults.antagonist_release_first = False
+    cfg.defaults.antagonist_payout = 1.0
     return cfg
 
 

@@ -16,7 +16,7 @@ from dexkit.config import FINGERS, ROLES, TENDONS, HandConfig, config_dir, dump_
 from dexkit.control.estop_key import SpaceWatch
 from dexkit.hw.base import N_FINGERS, GantryInterface, HandInterface
 from dexkit.hw.safety import ESTOP, EStop, EStopTripped, SafetyTrip
-from dexkit.util import Rate
+from dexkit.util import Rate, guarded_input, guarded_wait
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +27,8 @@ class Pose:
     roll: float = 0.0
 
     def __post_init__(self) -> None:
+        if not np.all(np.isfinite(self.fingers)) or not np.isfinite(self.roll):
+            raise ValueError("pose values must be finite")
         self.fingers = np.clip(np.asarray(self.fingers, dtype=float), 0.0, 1.0)
         if self.fingers.shape != (N_FINGERS,):
             raise ValueError(f"pose needs {N_FINGERS} finger values")
@@ -199,11 +201,14 @@ def go_to_pose(
     estop: EStop = ESTOP,
     on_tick: Callable[[Pose], None] | None = None,
     rate: Rate | None = None,
-    max_settle_ticks: int = 100,
+    max_settle_ticks: int = 10000,
     arrive_timeout_s: float = 12.0,
     arrive_tol: float = 0.05,
 ) -> Pose:
     f, r = hand.last_command
+    estop.register(hand=hand)
+    if hasattr(hand, "estop"):
+        hand.estop = estop
     start = Pose(f, r)
     rate = rate or Rate(rate_hz)
     for wp in pose_trajectory(start, pose, duration_s, rate_hz, mode):
@@ -221,7 +226,8 @@ def go_to_pose(
             break
         estop.check()
         f, r = hand.set_targets(pose.fingers, pose.roll)
-        if np.max(np.abs(f - prev_f)) < 1e-6 and abs(r - prev_r) < 1e-6:
+        if (np.max(np.abs(f - prev_f)) < 1e-6 and abs(r - prev_r) < 1e-6
+                and not getattr(hand, "_waiting_for_release", False)):
             break
         prev_f, prev_r = f, r
         rate.sleep()
@@ -238,9 +244,8 @@ def go_to_pose(
             if err < arrive_tol and abs(st.roll_deg - prev_r) < 3.0:
                 break
             if time.monotonic() > deadline:
-                log.warning("pose not reached within %.0fs (max finger error %.2f); continuing",
-                            arrive_timeout_s, err)
-                break
+                hand.relax()
+                raise SafetyTrip(f"pose not reached within {arrive_timeout_s:.0f}s (finger error {err:.2f}); torque off")
             hand.set_targets(prev_f, prev_r)  # keep commanding; also keeps the safety checks running
             rate.sleep()
     return pose
@@ -322,7 +327,7 @@ def interactive(hand: HandInterface, lib: PoseLibrary, rate_hz: float, duration:
         print(GANTRY_HELP)
     while True:
         try:
-            line = read("pose> ").strip()
+            line = guarded_input("pose> ", read, estop, hand).strip()
         except EOFError:
             return
         if not line:
@@ -445,7 +450,7 @@ def main(argv: list[str] | None = None) -> None:
                 hold_until = time.monotonic() + args.hold
                 while time.monotonic() < hold_until:
                     s.estop.check()
-                    time.sleep(0.05)
+                    guarded_wait(0.05, s.estop, s.hand)
             _finish_one_shot(s, args, t0)
     except EStopTripped as e:
         print(f"\nEMERGENCY STOP: {e}. Hand relaxed. Restart dexkit-pose to continue.")
