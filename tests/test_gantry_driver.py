@@ -125,11 +125,11 @@ def test_restore_frame(mock_gantry):
     assert np.allclose(mock_gantry.get_state().xyz, [12, 3, -1], atol=1e-6)
 
 
-def test_streaming_guard_skips_when_planner_full(mock_gantry, gantry_cfg):
+def test_streaming_guard_refreshes_stale_planner_capacity(mock_gantry, gantry_cfg):
     mock_gantry.set_zero()
     from dexkit.hw.grbl_protocol import StatusReport
 
     mock_gantry._last_status = StatusReport(state="Run", planner_free=1)
-    assert mock_gantry.move_to(1, 1, -1) is False
+    assert mock_gantry.move_to(1, 1, -1) is True  # fresh status reports that planner has drained
     mock_gantry._last_status = StatusReport(state="Run", planner_free=10)
     assert mock_gantry.move_to(1, 1, -1) is True

@@ -6,6 +6,7 @@ Every step is validated (pose names, travel box, feed) before anything moves.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,7 @@ from dexkit.control.estop_key import SpaceWatch
 from dexkit.control.poses import Pose, PoseLibrary, go_to_pose
 from dexkit.hw.base import GantryInterface, HandInterface
 from dexkit.hw.safety import ESTOP, EStop, EStopTripped, TravelBox
+from dexkit.util import guarded_wait
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +84,7 @@ def validate(
             continue
         kind = kinds[0]
         duration = float(raw.get("duration", 1.0))
-        if duration < 0:
+        if not math.isfinite(duration) or duration < 0:
             errors.append(f"step {i}: negative duration")
         if kind == "pose":
             name = str(raw["pose"])
@@ -91,10 +93,12 @@ def validate(
             steps.append(Step("pose", pose=name, duration=duration))
         elif kind == "roll":
             roll = float(raw["roll"])
-            if abs(roll) > roll_range:
+            if not math.isfinite(roll) or abs(roll) > roll_range:
                 errors.append(f"step {i}: roll {roll} outside +/-{roll_range} deg")
             steps.append(Step("roll", roll=roll, duration=duration))
         elif kind == "wait":
+            if not math.isfinite(float(raw["wait"])) or float(raw["wait"]) < 0:
+                errors.append(f"step {i}: wait must be finite and nonnegative")
             steps.append(Step("wait", duration=float(raw["wait"])))
         elif kind == "gantry":
             g = raw["gantry"]
@@ -105,7 +109,7 @@ def validate(
                 if ax in g:
                     xyz[j] = float(g[ax])
             feed = float(raw.get("feed", feed_default))
-            if feed <= 0:
+            if not math.isfinite(feed) or feed <= 0:
                 errors.append(f"step {i}: feed must be positive")
             if feed > feed_max:
                 errors.append(f"step {i}: feed {feed} exceeds feed_max {feed_max}")
@@ -143,8 +147,12 @@ def execute(
             if gantry is None:
                 raise SequenceError("gantry step but no gantry connected")
             assert step.xyz is not None
-            gantry.move_to(*step.xyz, feed=step.feed, wait=False)
             deadline = time.monotonic() + 120.0
+            while not gantry.move_to(*step.xyz, feed=step.feed, wait=False):
+                if time.monotonic() > deadline:
+                    raise TimeoutError("gantry did not accept sequence target")
+                gantry.get_state()
+                guarded_wait(0.05, estop, hand)
             while True:
                 estop.check()
                 st = gantry.get_state()
@@ -152,12 +160,9 @@ def execute(
                     break
                 if time.monotonic() > deadline:
                     raise TimeoutError("gantry move timed out")
-                time.sleep(0.1)
+                guarded_wait(0.1, estop, hand)
         elif step.kind == "wait":
-            end = time.monotonic() + step.duration
-            while time.monotonic() < end:
-                estop.check()
-                time.sleep(min(0.05, max(0.0, end - time.monotonic())))
+            guarded_wait(step.duration, estop, hand)
 
 
 def main(argv: list[str] | None = None) -> None:

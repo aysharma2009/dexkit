@@ -19,6 +19,7 @@ it moves (the shipped names are guesses).
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 import time
@@ -35,12 +36,13 @@ from dexkit.config import (
     data_dir,
     dump_yaml,
     hand_config_from_dict,
+    isolate_mock_data,
     load_hand_config,
     load_yaml,
 )
 from dexkit.hw.feetech_hand import FeetechDriver, open_serial
 from dexkit.hw.feetech_protocol import FeetechBus
-from dexkit.hw.safety import EStopTripped, SafetyTrip, VoltageGate
+from dexkit.hw.safety import EStopTripped, SafetyTrip, VoltageGate, estop_flag_path
 from dexkit.util import setup_logging
 
 HEADER = """# DexKit hand configuration (written by dexkit-calibrate-hand).
@@ -61,6 +63,8 @@ class Prompter:
         input(msg + " [Enter] ")
 
     def begin_keys(self) -> None:
+        if os.name == "nt":
+            return
         import termios
         import tty
 
@@ -69,6 +73,8 @@ class Prompter:
         tty.setcbreak(self._fd)
 
     def end_keys(self) -> None:
+        if os.name == "nt":
+            return
         import termios
 
         saved = getattr(self, "_saved", None)
@@ -77,7 +83,11 @@ class Prompter:
             self._saved = None
 
     def poll_key(self, timeout: float) -> str | None:
-        import os
+        if os.name == "nt":
+            from dexkit.util import windows_read_key
+
+            ch = windows_read_key(timeout)
+            return ch.decode("ascii", errors="replace").lower() if ch else None
         import select
 
         r, _, _ = select.select([sys.stdin], [], [], timeout)
@@ -109,11 +119,51 @@ class ScriptedPrompter(Prompter):
         return self._keys.popleft() if self._keys else "t"
 
 
+def calibration_stop_check(d: FeetechDriver, cfg: HandConfig) -> None:
+    if estop_flag_path().exists():
+        d.set_torque_all(cfg.ids, False)
+        raise EStopTripped("external e-stop during calibration")
+
+
+def calibration_feedback(d: FeetechDriver, sid: int, cfg: HandConfig) -> dict:
+    calibration_stop_check(d, cfg)
+    block = d.read_state_block([sid])
+    try:
+        if sid not in block:
+            raise SafetyTrip(f"servo {sid}: calibration feedback missing")
+        state = block[sid]
+        VoltageGate(cfg.voltage_window).check({sid: state["voltage"]}, [sid])
+        if state["temperature"] > cfg.max_temp_c:
+            raise SafetyTrip(f"servo {sid}: over-temperature during calibration")
+        return state
+    except SafetyTrip:
+        d.set_torque_all(cfg.ids, False)
+        raise
+
+
+def prepare_calibration(d: FeetechDriver, sid: int, cfg: HandConfig, speed: int | None = None) -> None:
+    calibration_stop_check(d, cfg)
+    if not d.set_torque(sid, False) or d.read_mode(sid) != 0:
+        raise SafetyTrip(f"servo {sid}: cannot confirm torque off and position mode")
+    v = d.read_voltage(sid)
+    VoltageGate(cfg.voltage_window).check({sid: v} if v is not None else {}, [sid])
+    temp = d.read_temperature(sid)
+    if temp is None or temp > cfg.max_temp_c:
+        raise SafetyTrip(f"servo {sid}: invalid/unsafe calibration temperature {temp}")
+    defaults = cfg.defaults
+    torque = min(defaults.calib_torque_limit, cfg.torque_for(sid))
+    checks = (d.set_torque_limit(sid, torque),
+              d.set_goal_torque(sid, torque),
+              d.set_accel(sid, defaults.accel),
+              d.set_speed(sid, defaults.speed if speed is None else speed))
+    if not all(checks):
+        raise SafetyTrip(f"servo {sid}: calibration settings not acknowledged")
+
+
 def capture_servo(
     d: FeetechDriver, sid: int, name: str, cfg: HandConfig, ui: Prompter, step_delay: float = 0.08,
     direction: int = 1,
 ) -> dict | None:
-    defaults = cfg.defaults
     ui.say(f"\n=== servo {sid} ({name}) ===")
     d.set_torque(sid, False)
     ui.wait_enter("  Torque OFF. Put this finger in its RELAXED, neutral position (not pulled either way) and hold it")
@@ -122,10 +172,7 @@ def capture_servo(
         ui.say("  no position reading; skipping")
         return None
     ui.say(f"  slack = {slack}")
-    d.set_torque_limit(sid, defaults.calib_torque_limit)
-    d.set_goal_torque(sid, defaults.calib_torque_limit)
-    d.set_accel(sid, defaults.accel)
-    d.set_speed(sid, defaults.speed)  # bench servos shipped with speed 100: they crawled
+    prepare_calibration(d, sid, cfg)
     d.write_position(sid, slack)
     d.set_torque(sid, True)
     ui.wait_enter("  Torque ON (low limit). Release the finger. Stepping will start; "
@@ -148,12 +195,8 @@ def capture_tight_from_open(
 ) -> dict | None:
     """Re-set only the curl limit: `open` is already known and trusted, so start there, wind
     slowly until the operator presses t, and return to open."""
-    defaults = cfg.defaults
     ui.say(f"\n=== {name} (servo {sid}): curl limit from its open position {open_pos} ===")
-    d.set_torque_limit(sid, defaults.calib_torque_limit)
-    d.set_goal_torque(sid, defaults.calib_torque_limit)
-    d.set_accel(sid, defaults.accel)
-    d.set_speed(sid, defaults.speed)
+    prepare_calibration(d, sid, cfg)
     d.write_position(sid, open_pos)
     d.set_torque(sid, True)
     ui.wait_enter("  Winding will start slowly from open; press t at a FIRM, unstrained curl "
@@ -176,31 +219,22 @@ AUTO_MAX_FRACTION = 1.15   # never travel more than this times the previous span
 def auto_tight_from_open(d: FeetechDriver, s: ServoConfig, cfg: HandConfig, open_pos: int, say) -> dict | None:
     """Find the curl limit without an operator: wind from open at calibration torque and stop where
     the load rises or the servo stalls. Checks the dexkit-estop flag every step."""
-    from dexkit.hw.safety import estop_flag_path
-
     defaults = cfg.defaults
     sid, sign = s.id, (1 if s.span >= 0 else -1)
     cap = int(AUTO_MAX_FRACTION * max(abs(s.span), 600))
-    d.set_goal_torque(sid, defaults.calib_torque_limit)
-    d.set_torque_limit(sid, defaults.calib_torque_limit)
-    d.set_accel(sid, defaults.accel)
-    d.set_speed(sid, 400)
+    prepare_calibration(d, sid, cfg, speed=400)
     d.write_position(sid, open_pos)
     d.set_torque(sid, True)
     time.sleep(0.6)
     goal, hits, log = open_pos, 0, []
     reason = "cap"
     while abs(goal - open_pos) < cap:
-        if estop_flag_path().exists():
-            d.set_torque_all(cfg.ids, False)
-            raise EStopTripped("dexkit-estop flag set during auto calibration")
+        calibration_stop_check(d, cfg)
         goal += sign * AUTO_STEP_TICKS
         d.write_position(sid, goal)
         time.sleep(AUTO_STEP_S)
-        pos = d.read_position(sid)
-        load = d.read_load(sid) or 0
-        if pos is None:
-            continue
+        state = calibration_feedback(d, sid, cfg)
+        pos, load = state["position"], state["load"]
         lag = abs(goal - pos)
         log.append((abs(goal - open_pos), load, lag))
         hits = hits + 1 if load >= AUTO_LOAD_STOP else 0
@@ -218,7 +252,7 @@ def auto_tight_from_open(d: FeetechDriver, s: ServoConfig, cfg: HandConfig, open
     d.write_position(sid, open_pos)
     time.sleep(0.2 + travel / 400)
     d.set_torque(sid, False)
-    d.set_goal_torque(sid, defaults.goal_torque)
+    d.set_goal_torque(sid, cfg.torque_for(sid))
     d.set_torque_limit(sid, defaults.torque_limit)
     if travel < 150:
         say(f"  {s.name}: barely moved before resisting; left unchanged (check the tendon)")
@@ -232,6 +266,7 @@ def _step_to_tight(d: FeetechDriver, sid: int, slack: int, cfg: HandConfig, ui: 
     defaults = cfg.defaults
     step = defaults.calib_step_ticks
     while True:
+        calibration_stop_check(d, cfg)
         key = ui.poll_key(step_delay)
         if key == " ":
             d.set_torque_all(cfg.ids, False)
@@ -256,6 +291,7 @@ def _step_to_tight(d: FeetechDriver, sid: int, slack: int, cfg: HandConfig, ui: 
             d.write_position(sid, goal)
             continue
         nxt = goal + direction * step
+        calibration_feedback(d, sid, cfg)
         if abs(nxt) > MAX_TICKS:
             ui.say(f"  reached the position limit (+/-{MAX_TICKS}) before 't'; stopping.")
             break
@@ -275,7 +311,7 @@ def _step_to_tight(d: FeetechDriver, sid: int, slack: int, cfg: HandConfig, ui: 
     time.sleep(0.3)
     d.set_torque(sid, False)
     d.set_torque_limit(sid, defaults.torque_limit)
-    d.set_goal_torque(sid, defaults.goal_torque)
+    d.set_goal_torque(sid, cfg.torque_for(sid))
     inverted = tight < slack
     stall = max(int(load * defaults.stall_load_factor), defaults.stall_load_floor)
     ui.say(f"  tight = {tight} (load {load}), inverted = {inverted}, stall_load = {stall}")
@@ -314,6 +350,7 @@ def tight_only(args: argparse.Namespace, cfg: HandConfig, raw: dict, out: Path, 
     by_id = {s["id"]: s for s in raw["servos"]}
     captured: list[int] = []
     try:
+        hand.driver.set_torque_all(cfg.finger_ids, False)  # opposing tendons must not brake calibration
         for s in chosen:
             i = cfg.servos.index(s)
             open_pos = int(hand._slack[i])
@@ -410,6 +447,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--scripted", action="store_true", help="scripted operator answers (for --mock)")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args(argv)
+    isolate_mock_data(args.mock)
     setup_logging(args.verbose)
 
     src = config_dir() / "hand.yaml"
@@ -421,7 +459,8 @@ def main(argv: list[str] | None = None) -> None:
         cfg.defaults.calib_step_ticks = max(1, args.step_ticks)
     if args.torque is not None:
         cfg.defaults.calib_torque_limit = min(max(0, args.torque), 1000)
-    if out.exists() and cfg.is_calibrated and args.servo is None and not args.force:
+    if (out.exists() and cfg.is_calibrated and args.servo is None and not args.force
+            and not (args.tight_only or args.tight_auto or args.wiring or args.label_only)):
         print(f"{out} already holds a full calibration from {cfg.calibrated_at}; use --force or --servo N")
         sys.exit(2)
     if (args.name or args.finger or args.label_only) and args.servo is None:
@@ -456,6 +495,11 @@ def main(argv: list[str] | None = None) -> None:
         cfg.defaults.calib_step_ticks = 20  # slower: we are looking for the limit, not taking up slack
 
     if args.tight_only or args.tight_auto:
+        if args.servo is not None:
+            matched = [s.name for s in cfg.servos if s.id == args.servo and s.enabled]
+            if not matched or args.only:
+                p.error("tight calibration --servo needs one enabled tendon and cannot be combined with --only")
+            args.only = matched[0]
         tight_only(args, cfg, raw, out, ui, step_delay)
         return
 
@@ -491,6 +535,7 @@ def main(argv: list[str] | None = None) -> None:
         volts = {sid: v for sid in targets if (v := d.read_voltage(sid)) is not None}
         VoltageGate(cfg.voltage_window).check(volts, expected_ids=targets)
         print("voltages OK:", ", ".join(f"{k}:{v:.1f}V" for k, v in volts.items()))
+        d.set_torque_all(cfg.ids, False)
 
         by_id = {s["id"]: s for s in raw["servos"]}
         if args.servo is not None and args.servo != cfg.roll.id and args.name:

@@ -68,6 +68,8 @@ def from_le16(lo: int, hi: int) -> int:
 
 def encode_position(ticks: int) -> list[int]:
     """Goal position bytes. Bit 15 is the sign bit on STS/HLS; we only use 0..4095."""
+    if not -0x7FFF <= ticks <= 0x7FFF:
+        raise ValueError("position outside signed 15-bit range")
     if ticks < 0:
         return le16((-ticks) | 0x8000)
     return le16(ticks)
@@ -220,7 +222,7 @@ class FeetechBus:
 
     def read(self, servo_id: int, address: int, length: int) -> bytes | None:
         resp = self._transact(read_packet(servo_id, address, length), servo_id)
-        if resp is None or len(resp[1]) != length:
+        if resp is None or resp[0] or len(resp[1]) != length:
             return None
         return resp[1]
 
@@ -229,7 +231,8 @@ class FeetechBus:
         if not expect_reply or servo_id == BROADCAST_ID:
             self._send(packet)
             return True
-        return self._transact(packet, servo_id) is not None
+        resp = self._transact(packet, servo_id)
+        return resp is not None and resp[0] == 0
 
     def sync_write(self, address: int, data_len: int, items: dict[int, list[int]]) -> None:
         if items:
@@ -244,8 +247,8 @@ class FeetechBus:
             resp = self._receive(deadline)
             if resp is None:
                 break
-            sid, _err, params = resp
-            if sid in ids and len(params) == length:
+            sid, err, params = resp
+            if not err and sid in ids and len(params) == length:
                 out[sid] = params
         return out
 

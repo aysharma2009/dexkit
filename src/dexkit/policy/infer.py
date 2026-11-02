@@ -46,13 +46,19 @@ def run_policy(env: DexKitEnv, nets, pcfg: PolicyConfig, stats: dict[str, np.nda
     deque: collections.deque = collections.deque([obs] * pcfg.obs_horizon, maxlen=pcfg.obs_horizon)
     rate = Rate(pcfg.rate_hz)
     done = 0
+
+    def safety_tick():
+        env.estop.check()
+        if hasattr(env.hand, "service_safety"):
+            env.hand.service_safety()
+
     while done < steps:
         images = np.stack([preprocess_image(o["image"], tuple(pcfg.crop_size)) for o in deque])
         agent = np.stack([normalize_data(o["agent_pos"], stats) for o in deque])
         nimage = torch.from_numpy(images).unsqueeze(0).to(device)
         nagent = torch.from_numpy(agent).float().unsqueeze(0).to(device)
         t0 = time.perf_counter()
-        naction = predict_actions(nets, scheduler, pcfg, nimage, nagent, num_inference_steps)
+        naction = predict_actions(nets, scheduler, pcfg, nimage, nagent, num_inference_steps, on_step=safety_tick)
         log.debug("denoise %.0f ms", (time.perf_counter() - t0) * 1000)
         actions = unnormalize_data(naction, stats)
         start = pcfg.obs_horizon - 1

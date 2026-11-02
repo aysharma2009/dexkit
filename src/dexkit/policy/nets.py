@@ -64,13 +64,18 @@ def predict_actions(
     nagent_pos: torch.Tensor,
     num_inference_steps: int,
     generator: torch.Generator | None = None,
+    on_step=None,
 ) -> np.ndarray:
     """Returns normalized actions (pred_horizon, action_dim)."""
     device = nimage.device
+    if on_step is not None:
+        on_step()
     obs_cond = encode_obs(nets, nimage, nagent_pos)
     naction = torch.randn((1, pcfg.pred_horizon, pcfg.action_dim), device=device, generator=generator)
     scheduler.set_timesteps(num_inference_steps)
     for k in scheduler.timesteps:
+        if on_step is not None:
+            on_step()
         noise_pred = nets["noise_pred_net"](sample=naction, timestep=k, global_cond=obs_cond)
         naction = scheduler.step(model_output=noise_pred, timestep=k, sample=naction).prev_sample
     return naction[0].detach().cpu().numpy()

@@ -59,6 +59,7 @@ def main(argv: list[str] | None = None) -> None:
                 s.gantry.move_to(*[float(v) for v in msg.position[:3]], wait=False)
 
             def publish_state(self) -> None:
+                s.estop.check()
                 hs = s.hand.get_state()
                 m = JointState()
                 m.header.stamp = self.get_clock().now().to_msg()

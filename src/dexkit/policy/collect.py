@@ -54,9 +54,15 @@ class EpisodeWriter:
             log.warning("episode too short (%d frames); discarded", n)
             return None
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        idx = len(list(self.out_dir.glob("episode_*.pkl")))
-        path = self.out_dir / f"episode_{idx:04d}.pkl"
-        with open(path, "wb") as f:
+        idx = 0
+        while True:
+            path = self.out_dir / f"episode_{idx:04d}.pkl"
+            try:
+                f = open(path, "xb")
+                break
+            except FileExistsError:
+                idx += 1
+        with f:
             pickle.dump({
                 "images": np.stack(self._imgs).astype(np.uint8),
                 "agent_pos": np.stack(self._pos),

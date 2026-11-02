@@ -12,7 +12,7 @@ import argparse
 import logging
 import sys
 
-from dexkit.config import load_gantry_config, load_hand_config
+from dexkit.config import isolate_mock_data, load_gantry_config, load_hand_config
 from dexkit.hw.feetech_protocol import BROADCAST_ID, FeetechBus
 from dexkit.hw.grbl_protocol import RT_FEED_HOLD, RT_JOG_CANCEL, RT_SOFT_RESET
 from dexkit.hw.safety import clear_estop_flag, set_estop_flag
@@ -38,6 +38,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--clear", action="store_true", help="clear the e-stop flag so motion can resume")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args(argv)
+    isolate_mock_data(args.mock)
     setup_logging(args.verbose)
     if args.clear:
         print("e-stop flag cleared" if clear_estop_flag() else "no e-stop flag was set")

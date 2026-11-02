@@ -85,6 +85,22 @@ class GrblGantry(GantryInterface):
         self._last_state: GantryState | None = None
         self._planned: np.ndarray | None = None  # end of queued jog motion, frame coords
         self.connected = False
+        self.estop = None
+        self.safety_service = None
+        self.persist_frame = True
+
+    def _check_stop(self) -> None:
+        if self.estop is not None:
+            self.estop.check()
+        if self.safety_service is not None:
+            try:
+                self.safety_service()
+            except SafetyTrip as exc:
+                if self.estop is not None:
+                    self.estop.trip(str(exc))
+                else:
+                    self.feed_hold()
+                raise
 
     # ---------------------------------------------------------------- I/O
 
@@ -121,10 +137,12 @@ class GrblGantry(GantryInterface):
 
     def _command(self, line: str, timeout: float | None = None) -> list[str]:
         """Send one line, wait for ok/error. Returns the other lines received meanwhile."""
+        self._check_stop()
         self._write(line.encode("ascii") + b"\n")
         deadline = time.monotonic() + (timeout or self.cfg.command_timeout_s)
         lines: list[str] = []
         while time.monotonic() < deadline:
+            self._check_stop()
             got = self._readline()
             if got is None or got == "":
                 continue
@@ -210,11 +228,25 @@ class GrblGantry(GantryInterface):
         if self.t is None:
             return
         try:
-            if self._frame_valid and self._last_state is not None:
-                self.save_frame()
             self._write(RT_FEED_HOLD)
             self._write(RT_JOG_CANCEL)
+            # A cached in-motion position must never become the next session's zero.
+            deadline = time.monotonic() + 2.0
+            while self._frame_valid and time.monotonic() < deadline:
+                st = self.get_state()
+                if st.state == "Idle" or (st.state == "Hold" and st.substate == "0"):
+                    self.save_frame()
+                    break
+                time.sleep(0.05)
+            else:
+                if self.persist_frame and frame_state_path().exists():
+                    frame_state_path().unlink()
         except Exception as e:  # noqa: BLE001
+            if self.persist_frame:
+                try:
+                    frame_state_path().unlink(missing_ok=True)
+                except OSError:
+                    log.error("could not discard saved gantry frame; do not restore it")
             log.debug("close: %s", e)
         try:
             self.t.close()
@@ -268,6 +300,7 @@ class GrblGantry(GantryInterface):
     def home(self) -> None:
         if int(self.settings.get(22, 0)) != 1:
             raise GrblError("homing is disabled ($22=0); use manual zeroing")
+        self._frame_valid = False
         self._command("$H", timeout=120.0)
         st = self.wait_idle(timeout=10.0)
         self._wco = self._wco or (0.0, 0.0, 0.0)
@@ -279,6 +312,8 @@ class GrblGantry(GantryInterface):
 
     def _clamp_feed(self, feed: float | None, default: float) -> float:
         f = default if feed is None else float(feed)
+        if not np.isfinite(f):
+            raise SafetyTrip("non-finite gantry feed")
         return float(np.clip(f, 1.0, self.cfg.feed_max_mm_min))
 
     def jog(self, dx: float, dy: float, dz: float, feed: float | None = None) -> bool:
@@ -286,6 +321,8 @@ class GrblGantry(GantryInterface):
         position), and skipped while more than jog_max_backlog_mm is still queued, so a held
         key with auto-repeat cannot pile up motion that keeps going after release."""
         delta = np.array([dx, dy, dz], dtype=float)
+        if not np.all(np.isfinite(delta)):
+            raise SafetyTrip("non-finite gantry jog")
         st = self.get_state()
         moving = st.state in ("Jog", "Run")
         base = self._planned if (moving and self._planned is not None) else st.xyz.copy()
@@ -311,14 +348,17 @@ class GrblGantry(GantryInterface):
         self._planned = None
 
     def move_to(self, x: float, y: float, z: float, feed: float | None = None, wait: bool = False) -> bool:
+        self._check_stop()
         if not self._frame_valid:
             raise SafetyTrip("gantry frame not valid: zero (manual) or home before moving")
         self.box.check(x, y, z)
         f = self._clamp_feed(feed, self.cfg.feed_default_mm_min)
         if not wait and self._last_status is not None and self._last_status.planner_free is not None:
             if self._last_status.planner_free < self.cfg.planner_min_free:
-                log.debug("planner nearly full (%d free); skipping send", self._last_status.planner_free)
-                return False
+                self.get_state()
+                if self._last_status.planner_free is not None and self._last_status.planner_free < self.cfg.planner_min_free:
+                    log.debug("planner nearly full (%d free); skipping send", self._last_status.planner_free)
+                    return False
         self._command(move_command(x, y, z, f))
         if wait:
             self.wait_idle()
@@ -328,6 +368,7 @@ class GrblGantry(GantryInterface):
         deadline = time.monotonic() + timeout
         period = 1.0 / self.cfg.status_hz
         while True:
+            self._check_stop()
             st = self.get_state()
             if st.state == "Idle":
                 return st
@@ -338,10 +379,12 @@ class GrblGantry(GantryInterface):
             time.sleep(period)
 
     def get_state(self) -> GantryState:
+        self._check_stop()
         self._write(RT_STATUS)
         deadline = time.monotonic() + 0.5
         status: StatusReport | None = None
         while time.monotonic() < deadline:
+            self._check_stop()
             got = self._readline()
             if not got:
                 continue

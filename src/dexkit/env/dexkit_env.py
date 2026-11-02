@@ -44,6 +44,11 @@ class DexKitEnv:
         self._last_gantry_target: np.ndarray | None = None
         self.last_action = np.zeros(ACTION_DIM)
         self.last_step_ms = 0.0
+        self.estop.register(hand=hand, gantry=gantry)
+        if hasattr(hand, "estop"):
+            hand.estop = estop
+        if gantry is not None and hasattr(gantry, "estop"):
+            gantry.estop = estop
 
     @property
     def gantry_enabled(self) -> bool:
@@ -91,6 +96,11 @@ class DexKitEnv:
         fingers, roll, xyz = split_action(action)
         if not np.all(np.isfinite(action)):
             raise SafetyTrip(f"non-finite action {action}")
+        if self.gantry is not None:
+            if not self.gantry.frame_valid:
+                raise SafetyTrip("gantry frame not valid; zero or home before stepping")
+            if hasattr(self.gantry, "box"):
+                self.gantry.box.check(*xyz)
         sent_f, sent_r = self.hand.set_targets(np.clip(fingers, 0.0, 1.0), roll)
         sent_xyz = xyz
         if self.gantry is not None:

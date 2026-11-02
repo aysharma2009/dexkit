@@ -10,6 +10,10 @@ Everything runs against simulated hardware (`--mock`), so the whole stack can be
 
 **New here? Read [HOW_TO_USE.md](HOW_TO_USE.md)** (and [CALIBRATION.md](CALIBRATION.md) for the one-time calibration): a step-by-step guide from plugging in to running poses.
 
+Read [CONTROL_SAFETY.md](CONTROL_SAFETY.md) for independent flexor/extensor calibration,
+release-before-pull behavior, per-tendon torque caps, feedback/stop handling, and the
+limits of controlling string and fabric from servo position alone.
+
 It runs natively on macOS as well as Linux. Ports are auto-detected by USB ID (`make ports` shows what was found), so the udev rule and the VM below are optional. To force a port, set `DEXKIT_HAND_PORT` or `DEXKIT_GANTRY_PORT`.
 
 ```

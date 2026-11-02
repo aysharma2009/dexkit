@@ -12,6 +12,7 @@ import numpy as np
 from dexkit.config import data_dir
 from dexkit.env.dexkit_env import DexKitEnv
 from dexkit.hw.base import ACTION_DIM, GANTRY_SLICE
+from dexkit.util import guarded_wait
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,10 @@ class Recording:
             rec = cls(t=z["t"], action=z["action"], state=z["state"])
         if rec.action.ndim != 2 or rec.action.shape[1] != ACTION_DIM:
             raise ValueError(f"{p}: action must be (N, {ACTION_DIM})")
+        if (rec.t.shape != (len(rec.action),) or rec.state.shape != rec.action.shape
+                or not np.all(np.isfinite(rec.t)) or not np.all(np.isfinite(rec.action))
+                or np.any(rec.t < 0) or np.any(np.diff(rec.t) < 0)):
+            raise ValueError(f"{p}: invalid recording timing, shape or non-finite actions")
         return rec
 
 
@@ -119,15 +124,19 @@ def replay(env: DexKitEnv, rec: Recording, speed: float = 1.0, lead_in_s: float 
     for i in range(1, n + 1):
         a = i / n
         env.step(start + (actions[0] - start) * a, observe=False)
-        time.sleep(1.0 / rate_hz)
+        guarded_wait(1.0 / rate_hz, env.estop, env.hand)
     if env.gantry is not None and use_gantry:
-        env.gantry.wait_idle(timeout=60.0)
+        deadline = time.monotonic() + 60
+        while env.gantry.get_state().state != "Idle":
+            if time.monotonic() > deadline:
+                raise TimeoutError("replay lead-in gantry move timed out")
+            guarded_wait(0.05, env.estop, env.hand)
     t0 = time.monotonic()
     for k in range(len(actions)):
         due = t0 + rec.t[k] / speed
         delay = due - time.monotonic()
         if delay > 0:
-            time.sleep(delay)
+            guarded_wait(delay, env.estop, env.hand)
         env.step(actions[k], observe=False)
     return len(actions)
 
